@@ -4,11 +4,16 @@
 
 import logging
 
-from .client import JellyfinClient
+from .client import JellyfinClient, AsyncJellyfinClient
 
 #################################################################################################
 
 __version__ = '1.11.0'
+
+__all__ = [
+    "AsyncJellyfinClient",
+    "JellyfinClient",
+]
 
 
 class NullHandler(logging.Handler):
@@ -88,7 +93,7 @@ class Jellyfin(object):
         if self.server_id not in self.client:
             return
 
-        self.client[self.server_id].stop()
+        self.client[self.server_id].close()
         self.client.pop(self.server_id, None)
 
         LOG.info("---[ STOPPED JELLYFINCLIENT: %s ]---", self.server_id)
@@ -97,7 +102,7 @@ class Jellyfin(object):
     def close_all(cls):
 
         for client in cls.client:
-            cls.client[client].stop()
+            cls.client[client].close()
 
         cls.client = {}
         LOG.info("---[ STOPPED ALL JELLYFINCLIENTS ]---")
