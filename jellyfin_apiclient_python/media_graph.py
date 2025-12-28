@@ -1,8 +1,13 @@
+import asyncio
+import contextlib
 import typing
 import rich
 import ubelt as ub
 import networkx as nx
 import progiter
+
+from jellyfin_apiclient_python.openapi._generated.models.item_fields import ItemFields
+from jellyfin_apiclient_python.openapi._generated.types import UNSET, Unset
 
 
 class MediaGraph:
@@ -98,6 +103,7 @@ class MediaGraph:
             'exclude_collection_types': None,
             'perquery_limit': 200,
             'query_attempts': 1,
+            'max_concurrency': 10,
         }
         self.display_config = {
             'show_path': False,
@@ -110,7 +116,9 @@ class MediaGraph:
         from jellyfin_apiclient_python.api import info
         # NOTE: It might not be a great idea to collect all fields by default
         # Things like CumulativeRunTimeTicks might require aggregation
-        self.fields = info()
+        self.fields = self._coerce_item_fields(info())
+
+        self._user_id = None
 
     @classmethod
     def ensure_demo_server(cls, reset=False):
@@ -134,22 +142,17 @@ class MediaGraph:
         Create a client for demos
 
         Returns:
-            jellyfin_apiclient_python.JellyfinClient
+            jellyfin_apiclient_python.openapi.Jellyfin
         """
         # TODO: Ensure test environment can spin up a dummy jellyfin server.
-        from jellyfin_apiclient_python import JellyfinClient
-        client = JellyfinClient()
-        client.config.app(
-            name='DemoApp',
-            version='0.0.1',
-            device_name='machine_name',
-            device_id='unique_id')
-        client.config.data["auth.ssl"] = True
+        from jellyfin_apiclient_python.openapi import Jellyfin
+
         url = 'http://127.0.0.1:8097'
         username = 'jellyfin'
         password = 'jellyfin'
-        client.auth.connect_to_address(url)
-        client.auth.login(url, username, password)
+
+        client = Jellyfin(base_url=url, username=username, password=password)
+        client.login()
         return client
 
     def tree(self, max_depth=None):
@@ -193,13 +196,21 @@ class MediaGraph:
         Perform an initial walk to build the graph using the user-specified
         configuration.
         """
+        if _event_loop_running():
+            raise RuntimeError('An event loop is already running. Use "await MediaGraph.async_setup()" instead.')
+
+        asyncio.run(self.async_setup())
+        return self
+
+    async def async_setup(self):
+        """Asynchronous entrypoint for building the media graph."""
         try:
-            self._init_media_folders()
+            await self._init_media_folders()
         finally:
             self._update_graph_labels()
         return self
 
-    def _init_media_folders(self):
+    async def _init_media_folders(self):
         # Initialize Graph
         if self._DEBUG:
             print('Initializing, clearing existing DiGraph')
@@ -225,11 +236,12 @@ class MediaGraph:
         with pman:
             if self._DEBUG:
                 print('Query top level media folder')
-            media_folders = client.jellyfin.get_media_folders(fields=['Path'])
+            media_folders = await client.api.library.get_media_folders.asyncio()
+            media_folder_dict = self._result_to_dict(media_folders)
             if self._DEBUG:
                 print('... top level query complete, scan top level folders')
             items = []
-            for folder in pman.progiter(media_folders['Items'], desc='Media Folders'):
+            for folder in pman.progiter(self._coerce_items(media_folder_dict.get('Items', [])), desc='Media Folders'):
                 collection_type = folder.get('CollectionType', None)
                 if include_collection_types is not None:
                     if collection_type not in include_collection_types:
@@ -238,35 +250,13 @@ class MediaGraph:
                     if collection_type not in exclude_collection_types:
                         continue
 
-                if 1:
-                    item = folder
-                else:
-                    # Weirdness is not needed if we have access to fields
-                    # in get-media-folders
-                    # Query API for children (todo: we want to async this)
-                    item_id = folder['Id']
-                    # This returns all root items, I'm not sure why
-                    # hack around it for now.
-                    _weird_result = client.jellyfin.user_items(params={
-                        'Id': item_id,
-                        'Recursive': False,
-                        'fields': ['Path'],
-                    })
-                    item = None
-                    for cand in _weird_result['Items']:
-                        if cand['Id'] == item_id:
-                            item = cand
-                            break
-                    assert item is not None
-
-                self._media_root_nodes.append(item['Id'])
-                items.append(item)
-                graph.add_node(item['Id'], item=item, properties=dict(expanded=False))
+                self._media_root_nodes.append(folder['Id'])
+                items.append(folder)
+                graph.add_node(folder['Id'], item=folder, properties=dict(expanded=False))
 
             if self._DEBUG:
                 print('... top level scan complete, starting media folder walk.')
-            for item in pman.progiter(items, desc='Walk Media Folders'):
-                self._walk_node(item, pman, stats, max_depth=initial_depth)
+            await self._walk_nodes(items, pman, stats, max_depth=initial_depth)
 
     def open_node(self, node, verbose=0, max_depth=1):
         """
@@ -276,6 +266,13 @@ class MediaGraph:
             print(f'open node={node}')
         node_data = self.graph.nodes[node]
         item = node_data['item']
+        if _event_loop_running():
+            raise RuntimeError('An event loop is already running. Use "await MediaGraph.async_open_node()" instead.')
+
+        asyncio.run(self.async_open_node(item, verbose=verbose, max_depth=max_depth))
+
+    async def async_open_node(self, item, verbose=0, max_depth=1):
+        """Asynchronous variant of :func:`open_node`."""
         pman = progiter.ProgressManager(verbose=verbose)
         stats = {
             'node_types': ub.ddict(int),
@@ -285,21 +282,21 @@ class MediaGraph:
             'latest_name': None,
         }
         with pman:
-            self._walk_node(item, pman, stats, max_depth=max_depth)
-        self._update_graph_labels(sources=[node])
+            await self._walk_nodes([item], pman, stats, max_depth=max_depth)
+        self._update_graph_labels(sources=[item['Id']])
 
         if verbose:
-            self.print_graph([node])
-            self.print_item(node)
+            self.print_graph([item['Id']])
+            self.print_item(item['Id'])
 
-    def _walk_node(self, item, pman, stats, max_depth=None):
+    async def _walk_nodes(self, items, pman, stats, max_depth=None):
         """
         Iterates through an items children and adds them to the graph until a
         limit is reached.
         """
         client = self.client
         if pman is not None:
-            folder_prog = pman.progiter(desc=f'Walking {item["Name"]}')
+            folder_prog = pman.progiter(desc='Walking media tree')
             folder_prog.start()
         else:
             folder_prog = None
@@ -320,102 +317,102 @@ class MediaGraph:
             item: dict
             depth: int
 
-        stack = [StackFrame(item, 0)]
-        while stack:
-            if pman is not None:
-                folder_prog.step()
-            frame = stack.pop()
+        walk_semaphore = asyncio.Semaphore(self.walk_config.get('max_concurrency', 10))
+        queue: asyncio.Queue[StackFrame | None] = asyncio.Queue()
+        for start in items:
+            await queue.put(StackFrame(start, 0))
 
-            if max_depth is not None and frame.depth >= max_depth:
-                continue
+        async def worker():
+            while True:
+                frame = await queue.get()
+                if frame is None:
+                    queue.task_done()
+                    break
 
-            parent = frame.item
-            node_data = graph.nodes[parent['Id']]
-            node_data['properties']['expanded'] = True
+                if max_depth is not None and frame.depth >= max_depth:
+                    if folder_prog is not None:
+                        folder_prog.step()
+                    queue.task_done()
+                    continue
 
-            stats['latest_name'] = parent['Name']
-            stats['latest_path'] = parent.get('Path', None)
+                parent = frame.item
+                node_data = graph.nodes[parent['Id']]
+                node_data['properties']['expanded'] = True
 
-            parent_id = parent['Id']
+                stats['latest_name'] = parent['Name']
+                stats['latest_path'] = parent.get('Path', None)
 
-            HANDLE_SPECIAL_FEATURES = 1
-            if HANDLE_SPECIAL_FEATURES:
-                if parent['Type'] in {'Series', 'Season'}:
-                    # Not sure why special features are not included as children
-                    special_features = client.jellyfin.user_items(f'/{parent_id}/SpecialFeatures')
-                    if special_features:
-                        # Hack in a dummy special features item into the graph
-                        special_features_id = parent_id + '/SpecialFeatures'
-                        special_features_item = {
-                            'Name': 'Special Features',
-                            'Id': special_features_id,
-                            'Type': 'SpecialFeatures',
-                        }
-                        special_parent = special_features_item
-                        graph.add_node(special_parent['Id'], item=special_parent, properties=dict(expanded=True))
-                        graph.add_edge(parent['Id'], special_parent['Id'])
-                        stats['edge_types'][(parent['Type'], special_parent['Type'])] += 1
-                        for special in special_features:
-                            stats['edge_types']['SpecialFeatures', special['Type']] += 1
-                            if special['Id'] in graph.nodes:
-                                stats['nondag_edge_types'][(parent['Type'], special['Type'])] += 1
-                                assert False, 'should not happen'
+                parent_id = parent['Id']
+
+                HANDLE_SPECIAL_FEATURES = 1
+                if HANDLE_SPECIAL_FEATURES and parent['Type'] in {'Series', 'Season'}:
+                    await self._attach_special_features(parent, stats, walk_semaphore)
+
+                # Pagenate children queries
+                perquery_limit = self.walk_config['perquery_limit']
+                offset = 0
+                need_more = True
+
+                fields = self.fields
+
+                while need_more:
+                    children = await self._safe_user_items(
+                        parent=parent,
+                        offset=offset,
+                        perquery_limit=perquery_limit,
+                        fields=fields,
+                        attempts=self.walk_config['query_attempts'],
+                        verbose=False,
+                        semaphore=walk_semaphore,
+                    )
+
+                    children = self._result_to_dict(children)
+                    child_items = self._coerce_items(children.get('Items', []))
+
+                    if child_items:
+                        stats['total'] += len(child_items)
+                        for child in child_items:
+                            if child['Id'] in graph.nodes:
+                                stats['nondag_edge_types'][(parent['Type'], child['Type'])] += 1
                             else:
-                                # Add child to graph
-                                graph.add_node(special['Id'], item=special, properties=dict(expanded=False))
-                                graph.add_edge(special_parent['Id'], special['Id'])
-                                assert not special['IsFolder']
+                                if child['Type'] not in type_add_blocklist:
+                                    stats['edge_types'][(parent['Type'], child['Type'])] += 1
+                                    stats['node_types'][child['Type']] += 1
 
-            # Pagenate children queries
-            perquery_limit = self.walk_config['perquery_limit']
-            offset = 0
-            need_more = True
+                                    # Add child to graph
+                                    graph.add_node(child['Id'], item=child, properties=dict(expanded=False))
+                                    graph.add_edge(parent['Id'], child['Id'])
 
-            fields = self.fields
+                                    if child['IsFolder'] and child['Type'] not in type_recurse_blocklist:
+                                        if max_depth is None or frame.depth + 1 < max_depth:
+                                            await queue.put(StackFrame(child, frame.depth + 1))
 
-            while need_more:
-                # Query API for children (todo: we want to async this)
-                children = self._safe_user_items(
-                    parent=parent,
-                    offset=offset,
-                    perquery_limit=perquery_limit,
-                    fields=fields,
-                    attempts=self.walk_config['query_attempts'],
-                    verbose=False,
-                )
+                    offset += len(child_items)
+                    total_record_count = children.get('TotalRecordCount')
+                    if total_record_count is None:
+                        need_more = len(child_items) >= perquery_limit
+                    else:
+                        need_more = offset < total_record_count
 
-                # Given the returned children,
-                if children and 'Items' in children:
-                    stats['total'] += len(children['Items'])
-                    for child in children['Items']:
-                        if child['Id'] in graph.nodes:
-                            stats['nondag_edge_types'][(parent['Type'], child['Type'])] += 1
-                        else:
-                            if child['Type'] not in type_add_blocklist:
-                                stats['edge_types'][(parent['Type'], child['Type'])] += 1
-                                stats['node_types'][child['Type']] += 1
+                    if timer.toc() > 1.1:
+                        if pman is not None:
+                            pman.update_info(ub.urepr(stats))
+                        timer.tic()
 
-                                # Add child to graph
-                                graph.add_node(child['Id'], item=child, properties=dict(expanded=False))
-                                graph.add_edge(parent['Id'], child['Id'])
+                if folder_prog is not None:
+                    folder_prog.step()
+                queue.task_done()
 
-                                if child['IsFolder'] and child['Type'] not in type_recurse_blocklist:
-                                    child_frame = StackFrame(child, frame.depth + 1)
-                                    stack.append(child_frame)
-
-                offset += len(children['Items'])
-                total_record_count = children['TotalRecordCount']
-                need_more = offset < total_record_count
-
-                if timer.toc() > 1.1:
-                    if pman is not None:
-                        pman.update_info(ub.urepr(stats))
-                    timer.tic()
+        workers = [asyncio.create_task(worker()) for _ in range(self.walk_config.get('max_concurrency', 10))]
+        await queue.join()
+        for _ in workers:
+            await queue.put(None)
+        await asyncio.gather(*workers)
 
         if folder_prog is not None:
             folder_prog.stop()
 
-    def _safe_user_items(self, *, parent, offset, perquery_limit, fields, attempts=1, base_sleep=0.5, verbose=False):
+    async def _safe_user_items(self, *, parent, offset, perquery_limit, fields, attempts=1, base_sleep=0.5, verbose=False, semaphore=None):
         """
         Returns children dict, or None if it repeatedly fails.
         """
@@ -433,13 +430,16 @@ class MediaGraph:
         last_err = None
         for attempt in range(1, attempts + 1):
             try:
-                children = client.jellyfin.user_items(params={
-                    'ParentId': parent_id,
-                    'Recursive': False,
-                    'fields': fields,
-                    'limit': perquery_limit,
-                    'startIndex': offset,
-                })
+                user_id = self._ensure_user_id()
+                async with (semaphore or _null_async_context()):
+                    children = await client.api.items.get_items.asyncio(
+                        parent_id=parent_id,
+                        user_id=user_id,
+                        recursive=False,
+                        fields=fields,
+                        limit=perquery_limit,
+                        start_index=offset,
+                    )
             except Exception as err:
                 last_err = err  # NOQA
                 # High-signal debug line (includes where you were)
@@ -455,8 +455,9 @@ class MediaGraph:
                 time.sleep(base_sleep * (2 ** (attempt - 1)))
             else:
                 if self._DEBUG:
-                    total_record_count = children['TotalRecordCount']
-                    if offset + perquery_limit < total_record_count:
+                    children_dict = self._result_to_dict(children)
+                    total_record_count = children_dict.get('TotalRecordCount')
+                    if total_record_count is not None and offset + perquery_limit < total_record_count:
                         print(f'...Got result {total_record_count=}')
                 return children
 
@@ -479,7 +480,7 @@ class MediaGraph:
             'FILM_FRAMES': '🎞',
         }
 
-        url = self.client.http.config.data['auth.server']
+        url = self.client.base_url
 
         graph = self.graph
 
@@ -627,6 +628,157 @@ class MediaGraph:
             )
 
         return matches[0]
+
+    async def _attach_special_features(self, parent, stats, semaphore):
+        """
+        Attach special features as children of a parent item when available.
+        """
+        client = self.client
+        user_id = self._ensure_user_id()
+        async with (semaphore or _null_async_context()):
+            special_features = await client.api.user_library.get_special_features.asyncio(
+                item_id=parent['Id'],
+                user_id=user_id,
+            )
+
+        special_items = self._coerce_items(special_features)
+        if not special_items:
+            return
+
+        graph = self.graph
+        special_features_id = parent['Id'] + '/SpecialFeatures'
+        special_features_item = {
+            'Name': 'Special Features',
+            'Id': special_features_id,
+            'Type': 'SpecialFeatures',
+            'IsFolder': True,
+        }
+        if special_features_id not in graph.nodes:
+            graph.add_node(special_features_id, item=special_features_item, properties=dict(expanded=True))
+            graph.add_edge(parent['Id'], special_features_id)
+            stats['edge_types'][(parent['Type'], special_features_item['Type'])] += 1
+
+        for special in special_items:
+            stats['edge_types']['SpecialFeatures', special['Type']] += 1
+            if special['Id'] in graph.nodes:
+                stats['nondag_edge_types'][(parent['Type'], special['Type'])] += 1
+            else:
+                graph.add_node(special['Id'], item=special, properties=dict(expanded=False))
+                graph.add_edge(special_features_id, special['Id'])
+                assert not special.get('IsFolder', False)
+
+    def _coerce_item_fields(self, fields):
+        """
+        Normalize field requests into a list of ItemFields / strings.
+        """
+        if fields is None:
+            return None
+
+        if isinstance(fields, str):
+            if ',' in fields:
+                fields = [f.strip() for f in fields.split(',') if f.strip()]
+            else:
+                fields = [fields]
+
+        coerced = []
+        for field in fields:
+            if isinstance(field, ItemFields):
+                coerced.append(field)
+                continue
+            field_name = str(field)
+            try:
+                coerced.append(ItemFields(field_name))
+            except Exception:
+                if self._DEBUG:
+                    print(f'[MediaGraph] Unknown ItemField: {field_name!r}, skipping')
+                continue
+        return coerced
+
+    def _result_to_dict(self, result):
+        """
+        Convert OpenAPI models to plain dictionaries for easier consumption.
+        """
+        if result is None or isinstance(result, Unset) or result is UNSET:
+            return {}
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, list):
+            return {'Items': self._coerce_items(result)}
+        if hasattr(result, 'to_dict'):
+            return result.to_dict()
+        return result
+
+    def _coerce_items(self, items):
+        """
+        Normalize items from OpenAPI objects / dicts into plain dictionaries.
+        """
+        if items is None or isinstance(items, Unset) or items is UNSET:
+            return []
+        if isinstance(items, dict):
+            return self._coerce_items(items.get('Items', []))
+
+        normalized = []
+        for item in items:
+            if item is None or isinstance(item, Unset):
+                continue
+            if hasattr(item, 'to_dict'):
+                item = item.to_dict()
+            if isinstance(item, dict):
+                normalized.append(self._normalize_item_dict(item))
+            else:
+                normalized.append(item)
+        return normalized
+
+    def _normalize_item_dict(self, item_dict):
+        """
+        Ensure required keys are present and enums are coerced to strings.
+        """
+        item = {}
+        for key, value in dict(item_dict).items():
+            if isinstance(value, Unset):
+                continue
+            if hasattr(value, 'value'):
+                value = value.value
+            item[key] = value
+
+        # Map snake_case keys to the legacy camel case that the graph expects
+        key_aliases = {
+            'id': 'Id',
+            'name': 'Name',
+            'type': 'Type',
+            'is_folder': 'IsFolder',
+            'collection_type': 'CollectionType',
+            'path': 'Path',
+        }
+        for src, dst in key_aliases.items():
+            if src in item and dst not in item:
+                item[dst] = item[src]
+
+        item.setdefault('IsFolder', False)
+        return item
+
+    def _ensure_user_id(self):
+        """
+        Lazily fetch the user id from the OpenAPI client.
+        """
+        if self._user_id is None:
+            # OpenAPI client exposes the user id via property
+            self._user_id = self.client.user_id
+        return self._user_id
+
+
+@contextlib.asynccontextmanager
+async def _null_async_context():
+    yield
+
+
+def _event_loop_running():
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    else:
+        return loop.is_running()
 
 
 def reachable(graph, sources=None):
