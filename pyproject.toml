@@ -21,13 +21,18 @@ dependencies=[
     'urllib3',
     'websocket_client',
     'certifi'
+    'attrs',
+    'python-dateutil'
+    'httpx'
 ]
 
 [project.urls]
 Repository = "https://github.com/iwalton3/jellyfin-apiclient-python"
 
 [tool.setuptools]
-packages = ["jellyfin_apiclient_python"]
+packages = [
+    "jellyfin_apiclient_python",
+]
 
 [tool.setuptools.dynamic]
 version = {attr = "jellyfin_apiclient_python.__version__"}
