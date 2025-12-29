@@ -199,7 +199,7 @@ class MediaGraph:
         if _event_loop_running():
             raise RuntimeError('An event loop is already running. Use "await MediaGraph.async_setup()" instead.')
 
-        asyncio.run(self.async_setup())
+        _run_coroutine_factory(self.async_setup)
         return self
 
     async def async_setup(self):
@@ -269,7 +269,7 @@ class MediaGraph:
         if _event_loop_running():
             raise RuntimeError('An event loop is already running. Use "await MediaGraph.async_open_node()" instead.')
 
-        asyncio.run(self.async_open_node(item, verbose=verbose, max_depth=max_depth))
+        _run_coroutine_factory(lambda: self.async_open_node(item, verbose=verbose, max_depth=max_depth))
 
     async def async_open_node(self, item, verbose=0, max_depth=1):
         """Asynchronous variant of :func:`open_node`."""
@@ -779,6 +779,33 @@ def _event_loop_running():
         return False
     else:
         return loop.is_running()
+
+
+def _run_coroutine_factory(coro_factory):
+    """
+    Run a coroutine produced by ``coro_factory`` in a fresh event loop.
+
+    This is robust to environments (e.g. IPython) where a default loop may have
+    been closed, which would otherwise trigger ``RuntimeError: Event loop is
+    closed``. If a loop is already running we surface a friendly error asking
+    the caller to ``await`` instead.
+    """
+    try:
+        return asyncio.run(coro_factory())
+    except RuntimeError as err:
+        msg = str(err).lower()
+        if 'asyncio.run() cannot be called from a running event loop' in msg:
+            raise RuntimeError('An event loop is already running. Use the async MediaGraph APIs directly.') from err
+        if 'event loop is closed' in msg:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(coro_factory())
+            finally:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+                asyncio.set_event_loop(None)
+        raise
 
 
 def reachable(graph, sources=None):
