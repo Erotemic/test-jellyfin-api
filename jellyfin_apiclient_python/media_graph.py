@@ -199,7 +199,7 @@ class MediaGraph:
         if _event_loop_running():
             raise RuntimeError('An event loop is already running. Use "await MediaGraph.async_setup()" instead.')
 
-        _run_coroutine_factory(self.async_setup)
+        _run_coroutine_factory(self.async_setup, reset_async_client=self._reset_async_client)
         return self
 
     async def async_setup(self):
@@ -269,7 +269,7 @@ class MediaGraph:
         if _event_loop_running():
             raise RuntimeError('An event loop is already running. Use "await MediaGraph.async_open_node()" instead.')
 
-        _run_coroutine_factory(lambda: self.async_open_node(item, verbose=verbose, max_depth=max_depth))
+        _run_coroutine_factory(lambda: self.async_open_node(item, verbose=verbose, max_depth=max_depth), reset_async_client=self._reset_async_client)
 
     async def async_open_node(self, item, verbose=0, max_depth=1):
         """Asynchronous variant of :func:`open_node`."""
@@ -440,6 +440,12 @@ class MediaGraph:
                         limit=perquery_limit,
                         start_index=offset,
                     )
+            except RuntimeError as err:
+                if 'event loop is closed' in str(err).lower():
+                    self._reset_async_client()
+                    continue
+                last_err = err
+                raise
             except Exception as err:
                 last_err = err  # NOQA
                 # High-signal debug line (includes where you were)
@@ -636,10 +642,20 @@ class MediaGraph:
         client = self.client
         user_id = self._ensure_user_id()
         async with (semaphore or _null_async_context()):
-            special_features = await client.api.user_library.get_special_features.asyncio(
-                item_id=parent['Id'],
-                user_id=user_id,
-            )
+            try:
+                special_features = await client.api.user_library.get_special_features.asyncio(
+                    item_id=parent['Id'],
+                    user_id=user_id,
+                )
+            except RuntimeError as err:
+                if 'event loop is closed' in str(err).lower():
+                    self._reset_async_client()
+                    special_features = await client.api.user_library.get_special_features.asyncio(
+                        item_id=parent['Id'],
+                        user_id=user_id,
+                    )
+                else:
+                    raise
 
         special_items = self._coerce_items(special_features)
         if not special_items:
@@ -766,6 +782,22 @@ class MediaGraph:
             self._user_id = self.client.user_id
         return self._user_id
 
+    def _reset_async_client(self):
+        """
+        Clear any cached httpx.AsyncClient tied to a dead event loop.
+        """
+        authed = getattr(self.client, 'client', None)
+        if authed is None:
+            return
+        async_client = getattr(authed, '_async_client', None)
+        if async_client is None:
+            return
+        with contextlib.suppress(Exception):
+            close = getattr(async_client, 'close', None)
+            if callable(close):
+                close()
+        authed._async_client = None
+
 
 @contextlib.asynccontextmanager
 async def _null_async_context():
@@ -781,7 +813,7 @@ def _event_loop_running():
         return loop.is_running()
 
 
-def _run_coroutine_factory(coro_factory):
+def _run_coroutine_factory(coro_factory, reset_async_client=None):
     """
     Run a coroutine produced by ``coro_factory`` in a fresh event loop.
 
@@ -797,6 +829,8 @@ def _run_coroutine_factory(coro_factory):
         if 'asyncio.run() cannot be called from a running event loop' in msg:
             raise RuntimeError('An event loop is already running. Use the async MediaGraph APIs directly.') from err
         if 'event loop is closed' in msg:
+            if reset_async_client is not None:
+                reset_async_client()
             loop = asyncio.new_event_loop()
             try:
                 asyncio.set_event_loop(loop)
