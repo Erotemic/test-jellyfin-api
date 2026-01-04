@@ -20,12 +20,20 @@ dependencies=[
     'requests',
     'urllib3',
     'websocket_client',
-    'certifi'
+    'certifi',
     'attrs',
-    'python-dateutil'
+    'python-dateutil',
     'httpx'
 ]
 
+
+[project.optional-dependencies]
+
+tests = [
+    "pytest>=8.1.1",
+    "respx",
+    "pytest-asyncio",
+]
 [project.urls]
 Repository = "https://github.com/iwalton3/jellyfin-apiclient-python"
 

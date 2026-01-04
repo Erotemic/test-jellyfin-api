@@ -72,9 +72,66 @@ For details on what the individual API calls do or how to do a certain task, you
 
 ## New OpenAPI client
 
-This repository now contains scaffolding for an OpenAPI-driven client that
-exposes async and sync wrappers. See the usage guide at
-`docs/source/manual/new_openapi_client_docs.rst` for examples.
+This repository now contains an OpenAPI-driven client with a small convenience
+wrapper. The generated code lives under ``jellyfin_apiclient_python.openapi._generated``
+and is exposed dynamically through ``jellyfin_apiclient_python.openapi.client.Jellyfin``.
+
+### Quick start (sync)
+
+```python
+from jellyfin_apiclient_python.openapi.client import Jellyfin
+
+# Password-based login (password is only used for this call when provided here)
+jf = Jellyfin(
+    base_url="http://localhost:8096",
+    username="your-username",
+)
+jf.login(password="your-password")
+
+# Call endpoints through the dynamic .api namespace
+system_info = jf.api.system.get_system_info()
+print(system_info.parsed.to_dict())
+
+folders_resp = jf.api.library.get_media_folders()
+for folder in folders_resp.parsed.items:
+    resp = jf.api.items.get_items.sync_detailed(parent_id=folder.id, limit=10)
+    print(folder.name, [item.name for item in resp.parsed.items])
+
+```
+
+### Quick start (async)
+
+```python
+import asyncio
+from jellyfin_apiclient_python.openapi.client import Jellyfin
+
+jf = Jellyfin(
+    base_url="http://localhost:8096",
+    username="your-username",
+    password="your-password",
+)
+jf.login()
+
+async def query(limit: int = 5):
+    sysinfo = await jf.api.system.get_system_info.asyncio_detailed()
+    print(sysinfo.parsed.to_dict())
+
+    folders_resp = await jf.api.library.get_media_folders.asyncio_detailed()
+    folders = folders_resp.parsed.items
+
+    async def fetch(folder):
+        return folder, await jf.api.items.get_items.asyncio_detailed(parent_id=folder.id, limit=limit)
+
+    tasks = [asyncio.create_task(fetch(folder)) for folder in folders]
+    for aw in asyncio.as_completed(tasks):
+        folder, resp = await aw
+        print(folder.name, [item.name for item in resp.parsed.items])
+
+asyncio.run(query())
+```
+
+See the usage guide at `docs/source/manual/new_openapi_client_docs.rst` for
+more details.
 
 ## Running the tests
 
